@@ -1,0 +1,6 @@
+dataset/
+artifacts/
+output/
+venv/
+__pycache__/
+*.pyc
