@@ -1,125 +1,457 @@
 """
-Candidate generation (blocking).
+Memory-efficient candidate generation.
 
-Strategy:
-  1. Group records by normalized country. This is just a bucket to shrink
-     the search space -- it is NOT a hard filter on the final match (a
-     record with a noisy/missing country can still be found; see the
-     "unblocked" fallback below). Works for any country string, including
-     ones never seen in training (e.g. France in the test set), because we
-     never hard-code a country list.
-  2. Within each bucket, fit a character n-gram TF-IDF vectorizer over
-     name_norm + " " + addr_norm for all S1/S2/S3 records in that bucket,
-     and use cosine nearest-neighbors to pull the top-K most similar S2/S3
-     records for every S1 record.
-  3. A small "unblocked" fallback pass handles S1 records whose country
-     bucket is empty/unmatched on the other side (e.g. a typo'd or missing
-     country) by searching across ALL records regardless of country.
-  4. Union everything, cap total candidates per S1 record, dedupe.
+Instead of building a huge TF-IDF matrix over millions of records,
+this implementation uses cheap blocking keys based on:
 
-Output: one row per (source1_entity_id, candidate_entity_id) with the
-cosine similarity that produced it (reused later as a feature).
+1. Country
+2. Business-name prefix
+3. Business-name tokens
+4. Address numeric tokens
+
+Multiple blocking strategies are UNIONED together so that a match
+can be discovered through more than one key.
+
+The expensive fuzzy features are still calculated later by features.py.
 """
+
+import re
+import gc
+from collections import defaultdict
+
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
 
 
-def _combined_text(df):
-    return (df["name_norm"] + " " + df["addr_norm"]).values
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def _tokens(text):
+    if text is None:
+        return []
+
+    text = str(text).strip()
+
+    if not text:
+        return []
+
+    return text.split()
 
 
-def _knn_candidates(s1_df, other_df, top_k, min_sim):
-    """Return list of (s1_entity_id, other_entity_id, cosine_sim)."""
+def _name_prefix(name, n=4):
+    """
+    First n characters of normalized business name.
+    """
+    if not name:
+        return ""
+
+    cleaned = re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+    return cleaned[:n]
+
+
+def _name_tokens(name):
+    """
+    Useful words from a normalized business name.
+
+    Very short tokens are ignored because words like:
+    'a', 'of', 'in' are weak blocking signals.
+    """
+    if not name:
+        return set()
+
+    tokens = set()
+
+    for token in str(name).split():
+
+        if len(token) >= 3:
+            tokens.add(token)
+
+    return tokens
+
+
+def _address_numbers(address):
+    """
+    Extract numeric pieces from an address.
+
+    Examples:
+
+        '17560 ellis road' -> {'17560'}
+        '1/95 westchester drive' -> {'1', '95'}
+        'kh no 570 1' -> {'570', '1'}
+    """
+
+    if not address:
+        return set()
+
+    return set(re.findall(r"\d+", str(address)))
+
+
+# ============================================================
+# BUILD INDEXES
+# ============================================================
+
+def _build_indexes(other_df):
+
+    prefix_index = defaultdict(list)
+    token_index = defaultdict(list)
+    number_index = defaultdict(list)
+
+    for row in other_df.itertuples():
+
+        entity_id = row.entity_id
+
+        # -------------------------
+        # Name prefix
+        # -------------------------
+
+        prefix = _name_prefix(row.name_norm)
+
+        if prefix:
+            prefix_index[prefix].append(entity_id)
+
+        # -------------------------
+        # Name tokens
+        # -------------------------
+
+        for token in _name_tokens(row.name_norm):
+            token_index[token].append(entity_id)
+
+        # -------------------------
+        # Address numbers
+        # -------------------------
+
+        for number in _address_numbers(row.addr_norm):
+            number_index[number].append(entity_id)
+
+    return prefix_index, token_index, number_index
+
+
+# ============================================================
+# CANDIDATES FOR ONE RECORD
+# ============================================================
+
+def _get_candidates(
+    s1_row,
+    prefix_index,
+    token_index,
+    number_index,
+    max_from_each_key=15,
+):
+    """
+    Generate candidates for one Source-1 record.
+
+    We deliberately limit the number obtained from each blocking key.
+    """
+
+    candidates = set()
+
+    # --------------------------------------------------------
+    # 1. Name prefix
+    # --------------------------------------------------------
+
+    prefix = _name_prefix(s1_row.name_norm)
+
+    if prefix:
+
+        ids = prefix_index.get(prefix, [])
+
+        candidates.update(ids[:max_from_each_key])
+
+    # --------------------------------------------------------
+    # 2. Name tokens
+    # --------------------------------------------------------
+
+    name_tokens = _name_tokens(s1_row.name_norm)
+
+    for token in name_tokens:
+
+        ids = token_index.get(token, [])
+
+        candidates.update(ids[:max_from_each_key])
+
+    # --------------------------------------------------------
+    # 3. Address numbers
+    # --------------------------------------------------------
+
+    numbers = _address_numbers(s1_row.addr_norm)
+
+    for number in numbers:
+
+        ids = number_index.get(number, [])
+
+        candidates.update(ids[:max_from_each_key])
+
+    return candidates
+
+
+# ============================================================
+# GENERATE CANDIDATES BETWEEN TWO SOURCES
+# ============================================================
+
+def _generate_source_pairs(
+    s1_df,
+    other_df,
+    src_name,
+    max_candidates_per_entity=40,
+):
+    """
+    Generate candidates from Source-1 to one other source.
+    """
+
     if len(s1_df) == 0 or len(other_df) == 0:
         return []
 
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
-    all_text = list(_combined_text(s1_df)) + list(_combined_text(other_df))
-    tfidf = vectorizer.fit_transform(all_text)
+    print(
+        f"    Building blocking indexes for {src_name}: "
+        f"{len(other_df):,} records"
+    )
 
-    s1_vec = tfidf[: len(s1_df)]
-    other_vec = tfidf[len(s1_df):]
-
-    k = min(top_k, len(other_df))
-    nn = NearestNeighbors(n_neighbors=k, metric="cosine")
-    nn.fit(other_vec)
-    distances, indices = nn.kneighbors(s1_vec)
+    (
+        prefix_index,
+        token_index,
+        number_index,
+    ) = _build_indexes(other_df)
 
     results = []
-    s1_ids = s1_df["entity_id"].values
-    other_ids = other_df["entity_id"].values
-    for i in range(len(s1_df)):
-        for j, dist in zip(indices[i], distances[i]):
-            sim = 1.0 - dist
-            if sim >= min_sim:
-                results.append((s1_ids[i], other_ids[j], float(sim)))
+
+    total = len(s1_df)
+
+    for counter, row in enumerate(
+        s1_df.itertuples(),
+        start=1,
+    ):
+
+        candidates = _get_candidates(
+            row,
+            prefix_index,
+            token_index,
+            number_index,
+        )
+
+        # Limit total candidates per S1 entity.
+        candidates = list(candidates)[
+            :max_candidates_per_entity
+        ]
+
+        for candidate_id in candidates:
+
+            results.append(
+                (
+                    row.entity_id,
+                    candidate_id,
+                    0.0,
+                    src_name,
+                )
+            )
+
+        # Progress every 50,000 records.
+        if counter % 50000 == 0:
+
+            print(
+                f"      processed "
+                f"{counter:,}/{total:,} S1 records"
+            )
+
+    # Free indexes before moving to next source.
+    del prefix_index
+    del token_index
+    del number_index
+
+    gc.collect()
+
     return results
 
 
-def generate_candidates(source1_df, source2_df, source3_df, top_k=15, min_sim=0.15,
-                         max_candidates_per_entity=40):
-    """
-    source1_df/source2_df/source3_df must already have name_norm/addr_norm/
-    country_norm columns (see preprocess.add_normalized_columns).
+# ============================================================
+# MAIN CANDIDATE GENERATION
+# ============================================================
 
-    Returns a DataFrame: source1_entity_id, candidate_entity_id, cosine_sim
-    -- already capped and deduped, ready to write as candidate_pairs.tsv
-    (after grouping into comma-joined lists) and to feed into features.py.
+def generate_candidates(
+    source1_df,
+    source2_df,
+    source3_df,
+    top_k=15,
+    min_sim=0.15,
+    max_candidates_per_entity=40,
+):
     """
+    Generate memory-efficient candidate pairs.
+
+    NOTE:
+    top_k and min_sim are kept in the function signature so that
+    train.py and predict.py do not need to be changed.
+
+    This implementation does not use TF-IDF.
+    """
+
+    print("\nStarting memory-efficient blocking...")
+
     all_pairs = []
 
-    # --- Pass 1: per-country blocking ---
-    countries = sorted(set(source1_df["country_norm"]))
-    for country in countries:
-        s1_c = source1_df[source1_df["country_norm"] == country]
-        s2_c = source2_df[source2_df["country_norm"] == country]
-        s3_c = source3_df[source3_df["country_norm"] == country]
+    # ========================================================
+    # SOURCE 1 -> SOURCE 2
+    # ========================================================
 
-        all_pairs += [(s1, s2, sim, "S2") for s1, s2, sim in
-                      _knn_candidates(s1_c, s2_c, top_k, min_sim)]
-        all_pairs += [(s1, s3, sim, "S3") for s1, s3, sim in
-                      _knn_candidates(s1_c, s3_c, top_k, min_sim)]
+    print("\nSource 1 -> Source 2")
 
-    pairs_df = pd.DataFrame(all_pairs, columns=["source1_entity_id", "candidate_entity_id",
-                                                  "cosine_sim", "src"])
-
-    # --- Pass 2: fallback for S1 entities that got few/no candidates ---
-    # (handles noisy/mismatched country labels)
-    counts = pairs_df.groupby("source1_entity_id").size()
-    weak_ids = set(source1_df["entity_id"]) - set(counts[counts >= 3].index)
-    if weak_ids:
-        s1_weak = source1_df[source1_df["entity_id"].isin(weak_ids)]
-        fb2 = [(s1, s2, sim, "S2") for s1, s2, sim in
-               _knn_candidates(s1_weak, source2_df, top_k, min_sim)]
-        fb3 = [(s1, s3, sim, "S3") for s1, s3, sim in
-               _knn_candidates(s1_weak, source3_df, top_k, min_sim)]
-        fb_df = pd.DataFrame(fb2 + fb3, columns=["source1_entity_id", "candidate_entity_id",
-                                                   "cosine_sim", "src"])
-        pairs_df = pd.concat([pairs_df, fb_df], ignore_index=True)
-
-    # dedupe (keep max sim if a pair appeared via both passes)
-    pairs_df = (pairs_df.sort_values("cosine_sim", ascending=False)
-                .drop_duplicates(subset=["source1_entity_id", "candidate_entity_id"]))
-
-    # cap candidates per S1 entity without groupby.apply (which can silently
-    # drop the constant grouping column on some pandas versions)
-    pairs_df = pairs_df.sort_values(["source1_entity_id", "cosine_sim"], ascending=[True, False])
-    pairs_df["_rank"] = pairs_df.groupby("source1_entity_id").cumcount()
-    pairs_df = pairs_df[pairs_df["_rank"] < max_candidates_per_entity].drop(columns="_rank")
-
-    return pairs_df.reset_index(drop=True)
-
-
-def candidates_to_tsv_rows(source1_ids, pairs_df):
-    """Build the one-row-per-S1-entity structure required for candidate_pairs.tsv."""
-    grouped = pairs_df.groupby("source1_entity_id")["candidate_entity_id"].apply(
-        lambda ids: ",".join(dict.fromkeys(ids))  # dedupe, preserve order
+    pairs_s2 = _generate_source_pairs(
+        source1_df,
+        source2_df,
+        "S2",
+        max_candidates_per_entity=max_candidates_per_entity,
     )
+
+    all_pairs.extend(pairs_s2)
+
+    del pairs_s2
+
+    gc.collect()
+
+    # ========================================================
+    # SOURCE 1 -> SOURCE 3
+    # ========================================================
+
+    print("\nSource 1 -> Source 3")
+
+    pairs_s3 = _generate_source_pairs(
+        source1_df,
+        source3_df,
+        "S3",
+        max_candidates_per_entity=max_candidates_per_entity,
+    )
+
+    all_pairs.extend(pairs_s3)
+
+    del pairs_s3
+
+    gc.collect()
+
+    # ========================================================
+    # DATAFRAME
+    # ========================================================
+
+    pairs_df = pd.DataFrame(
+        all_pairs,
+        columns=[
+            "source1_entity_id",
+            "candidate_entity_id",
+            "cosine_sim",
+            "src",
+        ],
+    )
+
+    del all_pairs
+
+    gc.collect()
+
+    # ========================================================
+    # DEDUPLICATE
+    # ========================================================
+
+    if len(pairs_df) == 0:
+
+        return pd.DataFrame(
+            columns=[
+                "source1_entity_id",
+                "candidate_entity_id",
+                "cosine_sim",
+                "src",
+            ]
+        )
+
+    pairs_df = pairs_df.drop_duplicates(
+        subset=[
+            "source1_entity_id",
+            "candidate_entity_id",
+        ]
+    )
+
+    # ========================================================
+    # CAP CANDIDATES
+    # ========================================================
+
+    pairs_df = pairs_df.sort_values(
+        [
+            "source1_entity_id",
+            "candidate_entity_id",
+        ]
+    )
+
+    pairs_df["_rank"] = (
+        pairs_df
+        .groupby("source1_entity_id")
+        .cumcount()
+    )
+
+    pairs_df = pairs_df[
+        pairs_df["_rank"] < max_candidates_per_entity
+    ].drop(
+        columns="_rank"
+    )
+
+    pairs_df = pairs_df.reset_index(
+        drop=True
+    )
+
+    print(
+        f"\nCandidate generation complete:"
+        f" {len(pairs_df):,} candidate pairs"
+    )
+
+    return pairs_df
+
+
+# ============================================================
+# TSV OUTPUT
+# ============================================================
+
+def candidates_to_tsv_rows(
+    source1_ids,
+    pairs_df,
+):
+    """
+    Convert candidate pairs into the required format:
+
+    source1_entity_id    candidate_entity_ids
+    """
+
+    if len(pairs_df) == 0:
+
+        return pd.DataFrame(
+            [
+                {
+                    "source1_entity_id": s1_id,
+                    "candidate_entity_ids": "",
+                }
+                for s1_id in source1_ids
+            ]
+        )
+
+    grouped = (
+        pairs_df
+        .groupby("source1_entity_id")[
+            "candidate_entity_id"
+        ]
+        .apply(
+            lambda ids: ",".join(
+                dict.fromkeys(ids)
+            )
+        )
+    )
+
     rows = []
+
     for s1_id in source1_ids:
-        rows.append({
-            "source1_entity_id": s1_id,
-            "candidate_entity_ids": grouped.get(s1_id, "")
-        })
+
+        rows.append(
+            {
+                "source1_entity_id": s1_id,
+                "candidate_entity_ids": grouped.get(
+                    s1_id,
+                    "",
+                ),
+            }
+        )
+
     return pd.DataFrame(rows)
