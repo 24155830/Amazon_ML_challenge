@@ -270,7 +270,9 @@ def candidates_to_tsv_rows(source1_ids, pairs_df):
         lambda ids: ",".join(dict.fromkeys(ids))
     )
 
+
     rows = []
+
     for s1_id in source1_ids:
         rows.append({
             "source1_entity_id": s1_id,
