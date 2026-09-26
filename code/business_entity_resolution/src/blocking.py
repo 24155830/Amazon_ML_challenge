@@ -36,7 +36,7 @@ _DIGIT_RE = re.compile(r"\d+")
 # Postings per key are capped at this many entries AT BUILD TIME (see point 1
 # above). Keep this equal to (or larger than) max_from_each_key semantics
 # from the original version.
-MAX_POSTINGS_PER_KEY = 15
+MAX_POSTINGS_PER_KEY = 400
 
 
 # ============================================================
